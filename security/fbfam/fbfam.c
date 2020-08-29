@@ -4,7 +4,9 @@
 #include <linux/errno.h>
 #include <linux/gfp.h>
 #include <linux/jiffies.h>
+#include <linux/printk.h>
 #include <linux/refcount.h>
+#include <linux/signal.h>
 #include <linux/slab.h>
 
 /**
@@ -168,6 +170,43 @@ int fbfam_exit(void)
 
 	if (refcount_dec_and_test(&stats->refc))
 		kfree(stats);
+
+	return 0;
+}
+
+/**
+ * fbfam_handle_attack() - Fork brute force attack detection.
+ * @signal: Signal number that causes the core dump.
+ *
+ * The crashing rate of an application is computed in milliseconds per fault in
+ * each crash. So, if this rate goes under a certain threshold there is a clear
+ * signal that the application is crashing quickly. At this moment, a fork brute
+ * force attack is happening.
+ *
+ * Return: -EFAULT if the current task doesn't have statistical data. Zero
+ *         otherwise.
+ */
+int fbfam_handle_attack(int signal)
+{
+	struct fbfam_stats *stats = current->fbfam_stats;
+	u64 delta_jiffies, delta_time;
+	u64 crashing_rate;
+
+	if (!stats)
+		return -EFAULT;
+
+	if (!(signal == SIGILL || signal == SIGBUS || signal == SIGKILL ||
+	      signal == SIGSEGV || signal == SIGSYS))
+		return 0;
+
+	stats->faults += 1;
+
+	delta_jiffies = get_jiffies_64() - stats->jiffies;
+	delta_time = jiffies64_to_msecs(delta_jiffies);
+	crashing_rate = delta_time / (u64)stats->faults;
+
+	if (crashing_rate < (u64)sysctl_crashing_rate_threshold)
+		pr_warn("fbfam: Fork brute force attack detected\n");
 
 	return 0;
 }

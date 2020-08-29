@@ -51,6 +51,7 @@
 #include "internal.h"
 
 #include <trace/events/sched.h>
+#include <fbfam/fbfam.h>
 
 int core_uses_pid;
 unsigned int core_pipe_limit;
@@ -825,6 +826,7 @@ fail_unlock:
 fail_creds:
 	put_cred(cred);
 fail:
+	fbfam_handle_attack(siginfo->si_signo);
 	return;
 }
 
