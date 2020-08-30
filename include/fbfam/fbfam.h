@@ -3,8 +3,12 @@
 #define _FBFAM_H_
 
 #include <linux/sched.h>
+#include <linux/sysctl.h>
 
 #ifdef CONFIG_FBFAM
+#ifdef CONFIG_SYSCTL
+extern struct ctl_table fbfam_sysctls[];
+#endif
 int fbfam_fork(struct task_struct *child);
 int fbfam_execve(void);
 int fbfam_exit(void);

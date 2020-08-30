@@ -77,6 +77,8 @@
 #include <linux/uaccess.h>
 #include <asm/processor.h>
 
+#include <fbfam/fbfam.h>
+
 #ifdef CONFIG_X86
 #include <asm/nmi.h>
 #include <asm/stacktrace.h>
@@ -2660,6 +2662,13 @@ static struct ctl_table kern_table[] = {
 		.proc_handler	= stack_erasing_sysctl,
 		.extra1		= SYSCTL_ZERO,
 		.extra2		= SYSCTL_ONE,
+	},
+#endif
+#ifdef CONFIG_FBFAM
+	{
+		.procname	= "fbfam",
+		.mode		= 0555,
+		.child		= fbfam_sysctls,
 	},
 #endif
 	{ }

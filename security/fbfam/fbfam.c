@@ -8,6 +8,17 @@
 #include <linux/slab.h>
 
 /**
+ * sysctl_crashing_rate_threshold - Crashing rate threshold.
+ *
+ * The rate's units are in milliseconds per fault.
+ *
+ * A fork brute force attack will be detected if the application's crashing rate
+ * falls under this threshold. So, the higher this value, the faster an attack
+ * will be detected.
+ */
+unsigned long sysctl_crashing_rate_threshold = 30000;
+
+/**
  * struct fbfam_stats - Fork brute force attack mitigation statistics.
  * @refc: Reference counter.
  * @faults: Number of crashes since jiffies.
