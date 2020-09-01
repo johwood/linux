@@ -4,8 +4,11 @@
 #include <linux/errno.h>
 #include <linux/gfp.h>
 #include <linux/jiffies.h>
+#include <linux/pid.h>
 #include <linux/printk.h>
+#include <linux/rcupdate.h>
 #include <linux/refcount.h>
+#include <linux/sched/signal.h>
 #include <linux/signal.h>
 #include <linux/slab.h>
 
@@ -24,7 +27,8 @@ unsigned long sysctl_crashing_rate_threshold = 30000;
  * struct fbfam_stats - Fork brute force attack mitigation statistics.
  * @refc: Reference counter.
  * @faults: Number of crashes since jiffies.
- * @jiffies: First fork or execve timestamp.
+ * @jiffies: First fork or execve timestamp. If zero, the attack detection is
+ *           disabled.
  *
  * The purpose of this structure is to manage all the necessary information to
  * compute the crashing rate of an application. So, it holds a first fork or
@@ -175,13 +179,69 @@ int fbfam_exit(void)
 }
 
 /**
- * fbfam_handle_attack() - Fork brute force attack detection.
+ * fbfam_kill_tasks() - Kill the offending tasks
+ *
+ * When a fork brute force attack is detected it is necessary to kill all the
+ * offending tasks. Since this function is called from fbfam_handle_attack(),
+ * and so, every time a core dump is triggered, only is needed to kill the
+ * others tasks that share the same statistical data, not the current one as
+ * this is in the path to be killed.
+ *
+ * When the SIGKILL signal is sent to the offending tasks, this function will be
+ * called again during the core dump due to the shared statistical data shows a
+ * quickly crashing rate. So, to avoid kill again the same tasks due to a
+ * recursive call of this function, it is necessary to disable the attack
+ * detection setting the jiffies to zero.
+ *
+ * To improve the for_each_process loop it is possible to end it when all the
+ * tasks that shared the same statistics are found.
+ *
+ * Return: -EFAULT if the current task doesn't have statistical data. Zero
+ *         otherwise.
+ */
+static int fbfam_kill_tasks(void)
+{
+	struct fbfam_stats *stats = current->fbfam_stats;
+	struct task_struct *p;
+	unsigned int to_kill, killed = 0;
+
+	if (!stats)
+		return -EFAULT;
+
+	to_kill = refcount_read(&stats->refc) - 1;
+	if (!to_kill)
+		return 0;
+
+	/* Disable the attack detection */
+	stats->jiffies = 0;
+	rcu_read_lock();
+
+	for_each_process(p) {
+		if (p == current || p->fbfam_stats != stats)
+			continue;
+
+		do_send_sig_info(SIGKILL, SEND_SIG_PRIV, p, PIDTYPE_PID);
+		pr_warn("fbfam: Offending process with PID %d killed\n",
+			p->pid);
+
+		killed += 1;
+		if (killed >= to_kill)
+			break;
+	}
+
+	rcu_read_unlock();
+	return 0;
+}
+
+/**
+ * fbfam_handle_attack() - Fork brute force attack detection and mitigation.
  * @signal: Signal number that causes the core dump.
  *
  * The crashing rate of an application is computed in milliseconds per fault in
  * each crash. So, if this rate goes under a certain threshold there is a clear
  * signal that the application is crashing quickly. At this moment, a fork brute
- * force attack is happening.
+ * force attack is happening. Under this scenario it is necessary to kill all
+ * the offending tasks in order to mitigate the attack.
  *
  * Return: -EFAULT if the current task doesn't have statistical data. Zero
  *         otherwise.
@@ -195,6 +255,10 @@ int fbfam_handle_attack(int signal)
 	if (!stats)
 		return -EFAULT;
 
+	/* The attack detection is disabled */
+	if (!stats->jiffies)
+		return 0;
+
 	if (!(signal == SIGILL || signal == SIGBUS || signal == SIGKILL ||
 	      signal == SIGSEGV || signal == SIGSYS))
 		return 0;
@@ -205,9 +269,11 @@ int fbfam_handle_attack(int signal)
 	delta_time = jiffies64_to_msecs(delta_jiffies);
 	crashing_rate = delta_time / (u64)stats->faults;
 
-	if (crashing_rate < (u64)sysctl_crashing_rate_threshold)
-		pr_warn("fbfam: Fork brute force attack detected\n");
+	if (crashing_rate >= (u64)sysctl_crashing_rate_threshold)
+		return 0;
 
+	pr_warn("fbfam: Fork brute force attack detected\n");
+	fbfam_kill_tasks();
 	return 0;
 }
 
