@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <asm/current.h>
 #include <fbfam/fbfam.h>
-#include <linux/errno.h>
 #include <linux/gfp.h>
 #include <linux/jiffies.h>
 #include <linux/pid.h>
@@ -51,6 +50,57 @@ struct fbfam_stats {
 	unsigned int faults;
 	u64 jiffies;
 };
+
+/**
+ * fbfam_enable() - Enable the detection and mitigation of a fork brute force
+ *                  attack.
+ *
+ * This function is implemented to be used in the prctl() system call.
+ *
+ * When a process calls the prctl() interface to enable the detection and
+ * mitigation of a fork brute force attack its shared statistical data is reset.
+ * This implies that the old information about times and crashes is lost.
+ *
+ * Return: -EFAULT if the current task doesn't have statistical data. Zero
+ *         otherwise.
+ */
+int fbfam_enable(void)
+{
+	struct fbfam_stats *stats = current->fbfam_stats;
+
+	if (!stats)
+		return -EFAULT;
+
+	stats->faults = 0;
+	stats->jiffies = get_jiffies_64();
+	return 0;
+}
+
+/**
+ * fbfam_disable() - Disable the detection and mitigation of a fork brute force
+ *                   attack.
+ *
+ * This function is implemented to be used in the prctl() system call.
+ *
+ * When a process calls the prctl() interface to disable the detection and
+ * mitigation of a fork brute force attack it is only necessary to set the
+ * jiffies stored in the shared statistical data to zero (as it is showed in the
+ * struct fbfam_stats's documentation). This implies that the old information
+ * about times is lost.
+ *
+ * Return: -EFAULT if the current task doesn't have statistical data. Zero
+ *         otherwise.
+ */
+int fbfam_disable(void)
+{
+	struct fbfam_stats *stats = current->fbfam_stats;
+
+	if (!stats)
+		return -EFAULT;
+
+	stats->jiffies = 0;
+	return 0;
+}
 
 /**
  * fbfam_new_stats() - Allocation of new statistics structure.

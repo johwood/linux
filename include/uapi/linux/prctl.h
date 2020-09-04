@@ -238,4 +238,8 @@ struct prctl_mm_map {
 #define PR_SET_IO_FLUSHER		57
 #define PR_GET_IO_FLUSHER		58
 
+/* Enable/disable the detection and mitigation of a fork brute force attack */
+#define PR_FBFAM_ENABLE		59
+#define PR_FBFAM_DISABLE	60
+
 #endif /* _LINUX_PRCTL_H */

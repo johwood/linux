@@ -72,6 +72,8 @@
 #include <asm/io.h>
 #include <asm/unistd.h>
 
+#include <fbfam/fbfam.h>
+
 #include "uid16.h"
 
 #ifndef SET_UNALIGN_CTL
@@ -2529,6 +2531,12 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 			return -EINVAL;
 
 		error = (current->flags & PR_IO_FLUSHER) == PR_IO_FLUSHER;
+		break;
+	case PR_FBFAM_ENABLE:
+		error = fbfam_enable();
+		break;
+	case PR_FBFAM_DISABLE:
+		error = fbfam_disable();
 		break;
 	default:
 		error = -EINVAL;
