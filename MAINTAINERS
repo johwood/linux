@@ -6658,6 +6658,13 @@ S:	Supported
 F:	Documentation/fault-injection/
 F:	lib/fault-inject.c
 
+FORK BRUTE FORCE ATTACK MITIGATION (FBFAM)
+M:	John Wood <john.wood@gmx.com>
+S:	Maintained
+F:	Documentation/security/fbfam.rst
+F:	include/fbfam/fbfam.h
+F:	security/fbfam/
+
 FBTFT Framebuffer drivers
 L:	dri-devel@lists.freedesktop.org
 L:	linux-fbdev@vger.kernel.org
