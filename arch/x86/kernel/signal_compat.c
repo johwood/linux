@@ -18,6 +18,7 @@
 static inline void signal_compat_build_tests(void)
 {
 	int _sifields_offset = offsetof(compat_siginfo_t, _sifields);
+	int nsigchld = 6;
 
 	/*
 	 * If adding a new si_code, there is probably new data in
@@ -30,7 +31,10 @@ static inline void signal_compat_build_tests(void)
 	BUILD_BUG_ON(NSIGSEGV != 9);
 	BUILD_BUG_ON(NSIGBUS  != 5);
 	BUILD_BUG_ON(NSIGTRAP != 5);
-	BUILD_BUG_ON(NSIGCHLD != 6);
+#ifdef CONFIG_SECURITY_FORK_BRUTE
+	nsigchld += 1;
+#endif
+	BUILD_BUG_ON(NSIGCHLD != nsigchld);
 	BUILD_BUG_ON(NSIGSYS  != 2);
 
 	/* This is part of the ABI and can never change in size: */
