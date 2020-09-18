@@ -1099,3 +1099,14 @@ DEFINE_LSM(brute) = {
 	.init = brute_init,
 	.blobs = &brute_blob_sizes,
 };
+
+bool brute_task_killed(struct task_struct *task)
+{
+	struct brute_stats **stats;
+
+	stats = brute_stats_ptr(task);
+	if (!*stats)
+		return false;
+
+	return IS_ERR(*stats) || brute_disabled();
+}
