@@ -36,3 +36,7 @@ obj-$(CONFIG_BPF_LSM)			+= bpf/
 # Object integrity file lists
 subdir-$(CONFIG_INTEGRITY)		+= integrity
 obj-$(CONFIG_INTEGRITY)			+= integrity/
+
+# Object brute file lists
+subdir-$(CONFIG_SECURITY_FORK_BRUTE)	+= brute
+obj-$(CONFIG_SECURITY_FORK_BRUTE)	+= brute/
