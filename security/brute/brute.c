@@ -4,12 +4,14 @@
 
 #include <asm/current.h>
 #include <linux/bug.h>
+#include <linux/cache.h>
 #include <linux/compiler.h>
 #include <linux/errno.h>
 #include <linux/gfp.h>
 #include <linux/init.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
+#include <linux/limits.h>
 #include <linux/list.h>
 #include <linux/lsm_hooks.h>
 #include <linux/printk.h>
@@ -17,6 +19,34 @@
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/sysctl.h>
+
+/**
+ * brute_timestamps_list_size - Last crashes timestamps list size.
+ *
+ * The application crash period is the time between the execve system call and
+ * the first fault or the time between two consecutives faults, but this has a
+ * drawback. If an application crashes once quickly from the execve system call
+ * or crashes twice in a short period of time for some reason, a false positive
+ * attack will be triggered. To avoid this scenario use a list of the i last
+ * crashes timestamps and compute the application crash period as follows:
+ *
+ * crash_period = (n_last_timestamp - n_minus_i_timestamp) / i;
+ *
+ * The brute_timestamps_list_size variable sets the size of this list.
+ */
+static unsigned int brute_timestamps_list_size __read_mostly = 5;
+
+/**
+ * brute_crash_period_threshold - Application crash period threshold.
+ *
+ * The units are expressed in milliseconds.
+ *
+ * A fork brute force attack will be detected if the application crash period
+ * falls under this threshold. So, the higher this value, the more sensitive the
+ * detection will be.
+ */
+static unsigned int brute_crash_period_threshold __read_mostly = 30000;
 
 /**
  * struct brute_stats - Fork brute force attack statistics.
@@ -318,6 +348,58 @@ static struct security_hook_list brute_hooks[] __lsm_ro_after_init = {
 	LSM_HOOK_INIT(task_free, brute_task_free),
 };
 
+#ifdef CONFIG_SYSCTL
+static unsigned int uint_one = 1;
+static unsigned int uint_max = UINT_MAX;
+static unsigned int max_brute_timestamps_list_size = 10;
+
+/**
+ * brute_sysctl_path - Sysctl attributes path.
+ */
+static struct ctl_path brute_sysctl_path[] = {
+	{ .procname = "kernel", },
+	{ .procname = "brute", },
+	{ }
+};
+
+/**
+ * brute_sysctl_table - Sysctl attributes.
+ */
+static struct ctl_table brute_sysctl_table[] = {
+	{
+		.procname	= "timestamps_list_size",
+		.data		= &brute_timestamps_list_size,
+		.maxlen		= sizeof(brute_timestamps_list_size),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec_minmax,
+		.extra1		= &uint_one,
+		.extra2		= &max_brute_timestamps_list_size,
+	},
+	{
+		.procname	= "crash_period_threshold",
+		.data		= &brute_crash_period_threshold,
+		.maxlen		= sizeof(brute_crash_period_threshold),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec_minmax,
+		.extra1		= &uint_one,
+		.extra2		= &uint_max,
+	},
+	{ }
+};
+
+/**
+ * brute_init_sysctl() - Initialize the sysctl interface.
+ */
+static void __init brute_init_sysctl(void)
+{
+	if (!register_sysctl_paths(brute_sysctl_path, brute_sysctl_table))
+		panic("Cannot register the sysctl interface\n");
+}
+
+#else
+static inline void brute_init_sysctl(void) { }
+#endif /* CONFIG_SYSCTL */
+
 /**
  * brute_init() - Initialize the brute LSM.
  *
@@ -328,6 +410,7 @@ static int __init brute_init(void)
 	pr_info("Brute initialized\n");
 	security_add_hooks(brute_hooks, ARRAY_SIZE(brute_hooks),
 			   KBUILD_MODNAME);
+	brute_init_sysctl();
 	return 0;
 }
 
