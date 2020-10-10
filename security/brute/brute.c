@@ -340,12 +340,142 @@ static void brute_task_free(struct task_struct *task)
 }
 
 /**
+ * brute_add_timestamp() - Add a new entry to the last crashes timestamps list.
+ * @stats: Statistics that hold the last crashes timestamps list.
+ * @new_entry: New timestamp to add to the list.
+ *
+ * The statistics that hold the last crashes timestamps list cannot be NULL. The
+ * new timestamp to add to the list cannot be NULL.
+ *
+ * Context: Must be called with stats->lock held.
+ */
+static void brute_add_timestamp(struct brute_stats *stats,
+				struct brute_timestamp *new_entry)
+{
+	list_add_tail(&new_entry->node, &stats->timestamps);
+	stats->timestamps_size += 1;
+}
+
+/**
+ * brute_old_timestamp_entry() - Get the oldest timestamp entry.
+ * @head: Last crashes timestamps list.
+ *
+ * Context: Must be called with stats->lock held.
+ * Return: The oldest entry added to the last crashes timestamps list.
+ */
+#define brute_old_timestamp_entry(head) \
+	list_first_entry(head, struct brute_timestamp, node)
+
+/**
+ * brute_update_timestamps_list() - Update the last crashes timestamps list.
+ * @stats: Statistics that hold the last crashes timestamps list.
+ * @new_entry: New timestamp to update the list.
+ *
+ * Add a new timestamp structure to the list if this one has not reached the
+ * maximum size yet. Replace the oldest timestamp entry otherwise.
+ *
+ * The statistics that hold the last crashes timestamps list cannot be NULL. The
+ * new timestamp to update the list cannot be NULL.
+ *
+ * Context: Must be called with stats->lock held.
+ * Return: The oldest timestamp that has been replaced. NULL otherwise.
+ */
+static struct brute_timestamp *
+brute_update_timestamps_list(struct brute_stats *stats,
+			     struct brute_timestamp *new_entry)
+{
+	unsigned int list_size;
+	struct brute_timestamp *old_entry;
+
+	list_size = (unsigned int)stats->timestamps_size;
+	if (list_size < brute_timestamps_list_size) {
+		brute_add_timestamp(stats, new_entry);
+		return NULL;
+	}
+
+	old_entry = brute_old_timestamp_entry(&stats->timestamps);
+	list_replace(&old_entry->node, &new_entry->node);
+	list_rotate_left(&stats->timestamps);
+
+	return old_entry;
+}
+
+/**
+ * brute_get_crash_period() - Get the application crash period.
+ * @new_entry: New timestamp added to the last crashes timestamps list.
+ * @old_entry: Old timestamp replaced in the last crashes timestamps list.
+ *
+ * The application crash period is computed as the difference between the newest
+ * crash timestamp and the oldest one divided by the size of the list. This way,
+ * the scenario where an application crashes few times in a short period of time
+ * due to reasons unrelated to a real attack is avoided.
+ *
+ * The new and old timestamp cannot be NULL.
+ *
+ * Context: Must be called with stats->lock held.
+ * Return: The application crash period in milliseconds.
+ */
+static u64 brute_get_crash_period(struct brute_timestamp *new_entry,
+				  struct brute_timestamp *old_entry)
+{
+	u64 jiffies;
+
+	jiffies = new_entry->jiffies - old_entry->jiffies;
+	jiffies /= (u64)brute_timestamps_list_size;
+
+	return jiffies64_to_msecs(jiffies);
+}
+
+/**
+ * brute_task_fatal_signal() - Target for the task_fatal_signal hook.
+ * @siginfo: Contains the signal information.
+ *
+ * To detect a fork brute force attack is necessary that the list that holds the
+ * last crashes timestamps be updated in every fatal crash. Then, an only when
+ * this list is large enough, the application crash period can be computed an
+ * compared with the defined threshold.
+ *
+ * It's mandatory to disable interrupts before acquiring the lock since the
+ * task_free hook can be called from an IRQ context during the execution of the
+ * task_fatal_signal hook.
+ */
+static void brute_task_fatal_signal(const kernel_siginfo_t *siginfo)
+{
+	struct brute_stats **stats;
+	struct brute_timestamp *new_entry, *old_entry;
+	unsigned long flags;
+	u64 crash_period;
+
+	stats = brute_stats_ptr(current);
+	if (WARN(!*stats, "No statistical data\n"))
+		return;
+
+	new_entry = brute_new_timestamp();
+	if (WARN(!new_entry, "Cannot allocate last crash timestamp\n"))
+		return;
+
+	spin_lock_irqsave(&(*stats)->lock, flags);
+	old_entry = brute_update_timestamps_list(*stats, new_entry);
+
+	if (old_entry) {
+		crash_period = brute_get_crash_period(new_entry, old_entry);
+		kfree(old_entry);
+
+		if (crash_period < (u64)brute_crash_period_threshold)
+			pr_warn("Fork brute force attack detected\n");
+	}
+
+	spin_unlock_irqrestore(&(*stats)->lock, flags);
+}
+
+/**
  * brute_hooks - Targets for the LSM's hooks.
  */
 static struct security_hook_list brute_hooks[] __lsm_ro_after_init = {
 	LSM_HOOK_INIT(task_alloc, brute_task_alloc),
 	LSM_HOOK_INIT(bprm_committing_creds, brute_task_execve),
 	LSM_HOOK_INIT(task_free, brute_task_free),
+	LSM_HOOK_INIT(task_fatal_signal, brute_task_fatal_signal),
 };
 
 #ifdef CONFIG_SYSCTL
