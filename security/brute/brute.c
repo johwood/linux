@@ -3,6 +3,7 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <asm/current.h>
+#include <asm/rwonce.h>
 #include <linux/bug.h>
 #include <linux/cache.h>
 #include <linux/compiler.h>
@@ -14,9 +15,14 @@
 #include <linux/limits.h>
 #include <linux/list.h>
 #include <linux/lsm_hooks.h>
+#include <linux/pid.h>
 #include <linux/printk.h>
 #include <linux/refcount.h>
+#include <linux/rwlock.h>
 #include <linux/sched.h>
+#include <linux/sched/signal.h>
+#include <linux/sched/task.h>
+#include <linux/signal.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/sysctl.h>
@@ -295,6 +301,28 @@ static void brute_task_execve(struct linux_binprm *bprm)
 }
 
 /**
+ * brute_timestamps_free() - Empty a last crashes timestamp list.
+ * @timestamps: Last crashes timestamps list to be emptied.
+ *
+ * Empty the last crashes timestamps list and deallocate all the entries. This
+ * list cannot be NULL.
+ *
+ * Context: Must be called with stats->lock held.
+ */
+static void brute_timestamps_free(struct list_head *timestamps)
+{
+	struct brute_timestamp *timestamp, *next;
+
+	if (list_empty(timestamps))
+		return;
+
+	list_for_each_entry_safe(timestamp, next, timestamps, node) {
+		list_del(&timestamp->node);
+		kfree(timestamp);
+	}
+}
+
+/**
  * brute_stats_free() - Deallocate a statistics structure.
  * @stats: Statistics to be freed.
  *
@@ -305,13 +333,7 @@ static void brute_task_execve(struct linux_binprm *bprm)
  */
 static void brute_stats_free(struct brute_stats *stats)
 {
-	struct brute_timestamp *timestamp, *next;
-
-	list_for_each_entry_safe(timestamp, next, &stats->timestamps, node) {
-		list_del(&timestamp->node);
-		kfree(timestamp);
-	}
-
+	brute_timestamps_free(&stats->timestamps);
 	spin_unlock(&stats->lock);
 	kfree(stats);
 }
@@ -427,13 +449,112 @@ static u64 brute_get_crash_period(struct brute_timestamp *new_entry,
 }
 
 /**
+ * brute_disabled() - Test the fork brute force attack detection disabling.
+ * @stats: Statistical data shared by all the fork hierarchy processes.
+ *
+ * The fork brute force attack detection enabling / disabling is based on the
+ * last crashes timestamps list current size. A size of zero indicates that this
+ * feature is disabled. A size greater than zero indicates that this attack
+ * detection is enabled.
+ *
+ * The statistical data shared by all the fork hierarchy processes cannot be
+ * NULL.
+ *
+ * It's mandatory to disable interrupts before acquiring the lock since the
+ * task_free hook can be called from an IRQ context during the execution of the
+ * task_fatal_signal hook.
+ *
+ * Return: True if the fork brute force attack detection is disabled. False
+ *         otherwise.
+ */
+static bool brute_disabled(struct brute_stats *stats)
+{
+	unsigned long flags;
+	bool disabled;
+
+	spin_lock_irqsave(&stats->lock, flags);
+	disabled = !stats->timestamps_size;
+	spin_unlock_irqrestore(&stats->lock, flags);
+
+	return disabled;
+}
+
+/**
+ * brute_disable() - Disable the fork brute force attack detection.
+ * @stats: Statistical data shared by all the fork hierarchy processes.
+ *
+ * To disable the fork brute force attack detection it's only necessary to empty
+ * the last crashes timestamps list. So, a list size of zero indicates that this
+ * feature is disabled and a list size greater than zero indicates that this
+ * attack detection is enabled.
+ *
+ * The statistical data shared by all the fork hierarchy processes cannot be
+ * NULL.
+ *
+ * Context: Must be called with stats->lock held.
+ */
+static void brute_disable(struct brute_stats *stats)
+{
+	brute_timestamps_free(&stats->timestamps);
+	stats->timestamps_size = 0;
+}
+
+/**
+ * brute_kill_offending_tasks() - Kill the offending tasks.
+ * @stats: Statistical data shared by all the fork hierarchy processes.
+ *
+ * When a fork brute force attack is detected it is necessary to kill all the
+ * offending tasks involved in the attack. In other words, it is necessary to
+ * kill all the tasks that share the same statistical data but not the ones that
+ * have the same group_leader that the current task since the latter are in the
+ * path to be killed.
+ *
+ * When the SIGKILL signal is sent to the offending tasks, this function will be
+ * called again from the task_fatal_signal hook due to a small crash period. So,
+ * to avoid kill again the same tasks due to a recursive call of this function,
+ * it is necessary to disable the attack detection for this fork hierarchy.
+ *
+ * The statistical data shared by all the fork hierarchy processes cannot be
+ * NULL.
+ *
+ * Context: Must be called with stats->lock held.
+ */
+static void brute_kill_offending_tasks(struct brute_stats *stats)
+{
+	struct task_struct *p;
+	struct brute_stats **p_stats;
+
+	if (refcount_read(&stats->refc) == 1)
+		return;
+
+	brute_disable(stats);
+	read_lock(&tasklist_lock);
+
+	for_each_process(p) {
+		if (p->group_leader == current->group_leader)
+			continue;
+
+		p_stats = brute_stats_ptr(p);
+		if (READ_ONCE(*p_stats) != stats)
+			continue;
+
+		do_send_sig_info(SIGKILL, SEND_SIG_PRIV, p, PIDTYPE_PID);
+		pr_warn_ratelimited("Offending process %d (%s) killed\n",
+				    p->pid, p->comm);
+	}
+
+	read_unlock(&tasklist_lock);
+}
+
+/**
  * brute_task_fatal_signal() - Target for the task_fatal_signal hook.
  * @siginfo: Contains the signal information.
  *
  * To detect a fork brute force attack is necessary that the list that holds the
  * last crashes timestamps be updated in every fatal crash. Then, an only when
  * this list is large enough, the application crash period can be computed an
- * compared with the defined threshold.
+ * compared with the defined threshold. If at this moment an attack is detected,
+ * all the offending tasks must be killed.
  *
  * It's mandatory to disable interrupts before acquiring the lock since the
  * task_free hook can be called from an IRQ context during the execution of the
@@ -450,6 +571,9 @@ static void brute_task_fatal_signal(const kernel_siginfo_t *siginfo)
 	if (WARN(!*stats, "No statistical data\n"))
 		return;
 
+	if (brute_disabled(*stats))
+		return;
+
 	new_entry = brute_new_timestamp();
 	if (WARN(!new_entry, "Cannot allocate last crash timestamp\n"))
 		return;
@@ -461,8 +585,10 @@ static void brute_task_fatal_signal(const kernel_siginfo_t *siginfo)
 		crash_period = brute_get_crash_period(new_entry, old_entry);
 		kfree(old_entry);
 
-		if (crash_period < (u64)brute_crash_period_threshold)
+		if (crash_period < (u64)brute_crash_period_threshold) {
 			pr_warn("Fork brute force attack detected\n");
+			brute_kill_offending_tasks(*stats);
+		}
 	}
 
 	spin_unlock_irqrestore(&(*stats)->lock, flags);
