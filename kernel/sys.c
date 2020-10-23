@@ -72,6 +72,8 @@
 #include <asm/io.h>
 #include <asm/unistd.h>
 
+#include <brute/brute.h>
+
 #include "uid16.h"
 
 #ifndef SET_UNALIGN_CTL
@@ -2529,6 +2531,12 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 			return -EINVAL;
 
 		error = (current->flags & PR_IO_FLUSHER) == PR_IO_FLUSHER;
+		break;
+	case PR_SECURITY_FORK_BRUTE_ENABLE:
+		error = brute_prctl_enable();
+		break;
+	case PR_SECURITY_FORK_BRUTE_DISABLE:
+		error = brute_prctl_disable();
 		break;
 	default:
 		error = -EINVAL;

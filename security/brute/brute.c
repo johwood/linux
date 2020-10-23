@@ -676,3 +676,74 @@ DEFINE_LSM(brute) = {
 	.blobs = &brute_blob_sizes,
 };
 
+/**
+ * brute_prctl_enable() - Enable the fork brute force attack detection.
+ *
+ * To enable the fork brute force attack detection the last crashes timestamps
+ * list must not be empty. So, if this list already contains entries nothing
+ * needs to be done. Otherwise, initialize the last crashes timestamps list with
+ * one entry set to now. This way, the application crash period can be computed
+ * at the next fault.
+ *
+ * It's mandatory to disable interrupts before acquiring the lock since the
+ * task_free hook can be called from an IRQ context during the execution of the
+ * prctl syscall.
+ *
+ * Return: -EFAULT if the current task doesn't have statistical data. -ENOMEM if
+ *         the allocation of the new timestamp structure fails. Zero otherwise.
+ */
+int brute_prctl_enable(void)
+{
+	struct brute_stats **stats;
+	struct brute_timestamp *timestamp;
+	unsigned long flags;
+
+	stats = brute_stats_ptr(current);
+	if (!*stats)
+		return -EFAULT;
+
+	timestamp = brute_new_timestamp();
+	if (!timestamp)
+		return -ENOMEM;
+
+	spin_lock_irqsave(&(*stats)->lock, flags);
+
+	if (!list_empty(&(*stats)->timestamps)) {
+		kfree(timestamp);
+		goto unlock;
+	}
+
+	list_add_tail(&timestamp->node, &(*stats)->timestamps);
+	(*stats)->timestamps_size = 1;
+
+unlock:
+	spin_unlock_irqrestore(&(*stats)->lock, flags);
+	return 0;
+}
+
+/**
+ * brute_prctl_disable() - Disable the fork brute force attack detection.
+ *
+ * It's mandatory to disable interrupts before acquiring the lock since the
+ * task_free hook can be called from an IRQ context during the execution of the
+ * prctl syscall.
+ *
+ * Return: -EFAULT if the current task doesn't have statistical data. Zero
+ *         otherwise.
+ */
+int brute_prctl_disable(void)
+{
+	struct brute_stats **stats;
+	unsigned long flags;
+
+	stats = brute_stats_ptr(current);
+	if (!*stats)
+		return -EFAULT;
+
+	spin_lock_irqsave(&(*stats)->lock, flags);
+	brute_disable(*stats);
+	spin_unlock_irqrestore(&(*stats)->lock, flags);
+
+	return 0;
+}
+
