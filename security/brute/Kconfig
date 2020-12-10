@@ -7,6 +7,7 @@ config SECURITY_FORK_BRUTE
 	  vulnerable userspace processes. The detection method is based on
 	  the application crash period and as a mitigation procedure all the
 	  offending tasks are killed. Like capabilities, this security module
-	  stacks with other LSMs.
+	  stacks with other LSMs. Further information can be found in
+	  Documentation/admin-guide/LSM/Brute.rst.
 
 	  If you are unsure how to answer this question, answer N.
