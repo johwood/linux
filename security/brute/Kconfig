@@ -6,6 +6,7 @@ config SECURITY_FORK_BRUTE
 	  This is an LSM that stops any fork brute force attack against
 	  vulnerable userspace processes. The detection method is based on
 	  the application crash period and as a mitigation procedure all the
-	  offending tasks are killed.
+	  offending tasks are killed. Further information can be found in
+	  Documentation/admin-guide/LSM/Brute.rst.
 
 	  If you are unsure how to answer this question, answer N.
