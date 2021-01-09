@@ -48,6 +48,24 @@
 //#include <linux/stat.h>
 //#include <linux/types.h>
 //#include <linux/uidgid.h>
+//#include <linux/math64.h>
+//#include <linux/netdevice.h>
+//#include <linux/path.h>
+//#include <linux/pid.h>
+//#include <linux/printk.h>
+//#include <linux/refcount.h>
+//#include <linux/rwlock.h>
+//#include <linux/rwlock_types.h>
+//#include <linux/sched.h>
+//#include <linux/sched/signal.h>
+//#include <linux/sched/task.h>
+//#include <linux/signal.h>
+//#include <linux/skbuff.h>
+//#include <linux/slab.h>
+//#include <linux/spinlock.h>
+//#include <linux/stat.h>
+//#include <linux/types.h>
+//#include <linux/uidgid.h>
 
 /**
  * struct brute_cred - Saved credentials.
@@ -584,6 +602,125 @@ static inline void brute_print_fork_attack_running(void)
 }
 
 /**
+ * brute_disabled() - Test if the brute force attack detection is disabled.
+ * @stats: Statistical data shared by all the fork hierarchy processes.
+ *
+ * The brute force attack detection enabling/disabling is based on the last
+ * crash timestamp. A zero timestamp indicates that this feature is disabled. A
+ * timestamp greater than zero indicates that the attack detection is enabled.
+ *
+ * The statistical data shared by all the fork hierarchy processes cannot be
+ * NULL.
+ *
+ * It's mandatory to disable interrupts before acquiring the brute_stats::lock
+ * since the task_free hook can be called from an IRQ context during the
+ * execution of the task_fatal_signal hook.
+ *
+ * Context: Must be called with interrupts disabled and brute_stats_ptr_lock
+ *          held.
+ * Return: True if the brute force attack detection is disabled. False
+ *         otherwise.
+ */
+static bool brute_disabled(struct brute_stats *stats)
+{
+	bool disabled;
+
+	spin_lock(&stats->lock);
+	disabled = !stats->jiffies;
+	spin_unlock(&stats->lock);
+
+	return disabled;
+}
+
+/**
+ * brute_disable() - Disable the brute force attack detection.
+ * @stats: Statistical data shared by all the fork hierarchy processes.
+ *
+ * To disable the brute force attack detection it is only necessary to set the
+ * last crash timestamp to zero. A zero timestamp indicates that this feature is
+ * disabled. A timestamp greater than zero indicates that the attack detection
+ * is enabled.
+ *
+ * The statistical data shared by all the fork hierarchy processes cannot be
+ * NULL.
+ *
+ * Context: Must be called with interrupts disabled and brute_stats_ptr_lock
+ *          and brute_stats::lock held.
+ */
+static inline void brute_disable(struct brute_stats *stats)
+{
+	stats->jiffies = 0;
+}
+
+/**
+ * enum brute_attack_type - Brute force attack type.
+ * @BRUTE_ATTACK_TYPE_FORK: Attack that happens through the fork system call.
+ * @BRUTE_ATTACK_TYPE_EXEC: Attack that happens through the execve system call.
+ */
+enum brute_attack_type {
+	BRUTE_ATTACK_TYPE_FORK,
+	BRUTE_ATTACK_TYPE_EXEC,
+};
+
+/**
+ * brute_kill_offending_tasks() - Kill the offending tasks.
+ * @attack_type: Brute force attack type.
+ * @stats: Statistical data shared by all the fork hierarchy processes.
+ *
+ * When a brute force attack is detected all the offending tasks involved in the
+ * attack must be killed. In other words, it is necessary to kill all the tasks
+ * that share the same statistical data. Moreover, if the attack happens through
+ * the fork system call, the processes that have the same group_leader that the
+ * current task must be avoided since they are in the path to be killed.
+ *
+ * When the SIGKILL signal is sent to the offending tasks, this function will be
+ * called again from the task_fatal_signal hook due to a small crash period. So,
+ * to avoid kill again the same tasks due to a recursive call of this function,
+ * it is necessary to disable the attack detection for this fork hierarchy.
+ *
+ * The statistical data shared by all the fork hierarchy processes cannot be
+ * NULL.
+ *
+ * It's mandatory to disable interrupts before acquiring the brute_stats::lock
+ * since the task_free hook can be called from an IRQ context during the
+ * execution of the task_fatal_signal hook.
+ *
+ * Context: Must be called with interrupts disabled and tasklist_lock and
+ *          brute_stats_ptr_lock held.
+ */
+static void brute_kill_offending_tasks(enum brute_attack_type attack_type,
+				       struct brute_stats *stats)
+{
+	struct task_struct *p;
+	struct brute_stats **p_stats;
+
+	spin_lock(&stats->lock);
+
+	if (attack_type == BRUTE_ATTACK_TYPE_FORK &&
+	    refcount_read(&stats->refc) == 1) {
+		spin_unlock(&stats->lock);
+		return;
+	}
+
+	brute_disable(stats);
+	spin_unlock(&stats->lock);
+
+	for_each_process(p) {
+		if (attack_type == BRUTE_ATTACK_TYPE_FORK &&
+		    p->group_leader == current->group_leader)
+			continue;
+
+		p_stats = brute_stats_ptr(p);
+		if (*p_stats != stats)
+			continue;
+
+		do_send_sig_info(SIGKILL, SEND_SIG_PRIV, p, PIDTYPE_PID);
+		pr_warn_ratelimited("Offending process %d [%s] killed\n",
+				    p->pid, p->comm);
+	}
+}
+
+/**
  * brute_manage_fork_attack() - Manage a fork brute force attack.
  * @stats: Statistical data shared by all the fork hierarchy processes. Cannot
  *         be NULL.
@@ -595,8 +732,158 @@ static inline void brute_print_fork_attack_running(void)
 static void brute_manage_fork_attack(struct brute_stats *stats, u64 now)
 {
 	brute_update_crash_period(stats, now);
-	if (brute_attack_running(stats))
+	if (brute_attack_running(stats)) {
 		brute_print_fork_attack_running();
+		brute_kill_offending_tasks(BRUTE_ATTACK_TYPE_FORK, stats);
+	}
+}
+
+/**
+ * brute_exec_stats() - Get the exec statistics.
+ * @stats: Current process' statistical data.
+ * @exec_pid: If the exec statistics are found it returns the pid of the task
+ *            that holds them.
+ *
+ * To manage a brute force attack that happens through the execve system call it
+ * is not possible to use the statistical data hold by this process due to these
+ * statistics disappear when this task is finished. In this scenario this data
+ * should be tracked by the statistics of a higher fork hierarchy (the hierarchy
+ * that contains the process that forks before the execve system call).
+ *
+ * To find these statistics the current fork hierarchy must be traversed up
+ * until new statistics are found.
+ *
+ * Return: The exec statistics if they can be found. NULL otherwise.
+ */
+static struct brute_stats *brute_exec_stats(const struct brute_stats *stats,
+					    pid_t *exec_pid)
+{
+	struct task_struct *task = current;
+	struct brute_stats **exec_stats_ptr;
+	struct brute_stats *exec_stats;
+	bool found = false;
+
+	rcu_read_lock();
+	while (task->pid > 0) {
+		if (!thread_group_leader(task))
+			task = rcu_dereference(task->group_leader);
+
+		task = rcu_dereference(task->real_parent);
+		exec_stats_ptr = brute_stats_ptr(task);
+		exec_stats = READ_ONCE(*exec_stats_ptr);
+
+		if (WARN_ON_ONCE(IS_ERR_OR_NULL(exec_stats))) {
+			brute_manage_no_stats_attack(exec_stats_ptr, task);
+			continue;
+		}
+		
+		if (stats != exec_stats) {
+			*exec_pid = task->pid;
+			found = true;
+			break;
+		}
+	}
+	rcu_read_unlock();
+
+	return found ? exec_stats : NULL;
+}
+
+/**
+ * brute_update_exec_crash_period() - Update the exec crash period.
+ * @stats: Current process' statistical data.
+ * @now: The current timestamp in jiffies.
+ * @last_fork_crash: The last fork crash timestamp before updating it.
+ * @exec_pid: If there are exec statistics it returns the pid of the task that
+ *            holds them.
+ *
+ * If this is the first update of the statistics used to manage a brute force
+ * attack that happens through the execve system call, its last crash timestamp
+ * (the timestamp that shows when the execve was called) cannot be used to
+ * compute the crash period's EMA. Instead, the last fork crash timestamp should
+ * be used (the last crash timestamp of the child fork hierarchy before updating
+ * the crash period). This allows that in a brute force attack that happens
+ * through the fork system call, the exec and fork statistics are the same. In
+ * this situation, the mitigation method will act only in the processes that are
+ * sharing the fork statistics. This way, the process that forked before the
+ * execve system call will not be involved in the mitigation method. In this
+ * scenario, the parent is not responsible of the child's behaviour.
+ *
+ * Return: NULL if there are no exec statistics. The updated exec statistics
+ *         otherwise.
+ */
+static struct brute_stats *
+brute_update_exec_crash_period(const struct brute_stats *stats, u64 now,
+			       u64 last_fork_crash, pid_t *exec_pid)
+{
+	struct brute_stats *exec_stats;
+
+	exec_stats = brute_exec_stats(stats, exec_pid);
+	if (!exec_stats)
+		return NULL;
+
+	if (!READ_ONCE(exec_stats->faults)) {
+		spin_lock(&exec_stats->lock);
+		WRITE_ONCE(exec_stats->jiffies, last_fork_crash);
+		spin_unlock(&exec_stats->lock);
+	}
+
+	brute_update_crash_period(exec_stats, now);
+	return exec_stats;
+}
+
+/**
+ * brute_print_exec_attack_running() - Warn about an exec brute force attack.
+ * @exec_pid: The pid of the task that holds the exec statistics.
+ */
+static void brute_print_exec_attack_running(pid_t exec_pid)
+{
+	struct pid *pid;
+	struct task_struct *task;
+
+	pid = find_get_pid(exec_pid);
+	rcu_read_lock();
+	task = pid_task(pid, PIDTYPE_PID);
+	pr_warn("Exec brute force attack detected [pid %d, %s]\n", exec_pid,
+		task ? task->comm : "unknown");
+	rcu_read_unlock();
+	put_pid(pid);
+}
+
+/**
+ * brute_manage_exec_attack() - Manage an exec brute force attack.
+ * @stats: Statistical data shared by all the fork hierarchy processes.
+ * @now: The current timestamp in jiffies.
+ * @last_fork_crash: The last fork crash timestamp before updating it.
+ *
+ * For a correct management of an exec brute force attack it is only necessary
+ * to update the exec statistics and test if an attack is happening based on
+ * these data.
+ *
+ * It is important to note that if the fork and exec crash periods are the same,
+ * the attack test is avoided. This allows that in a brute force attack that
+ * happens through the fork system call, the mitigation method does not act on
+ * the parent process of the fork hierarchy.
+ *
+ * Also, the scenario where there are no exec statistics is not treated as an
+ * attack since it is possible for the forks of the init task.
+ */
+static void brute_manage_exec_attack(const struct brute_stats *stats, u64 now,
+				     u64 last_fork_crash)
+{
+	struct brute_stats *exec_stats;
+	pid_t exec_pid;
+
+	exec_stats = brute_update_exec_crash_period(stats, now, last_fork_crash,
+						    &exec_pid);
+	if (!exec_stats ||
+	    READ_ONCE(stats->period) == READ_ONCE(exec_stats->period))
+		return;
+
+	if (brute_attack_running(exec_stats)) {
+		brute_print_exec_attack_running(exec_pid);
+		brute_kill_offending_tasks(BRUTE_ATTACK_TYPE_EXEC, exec_stats);
+	}
+>>>>>>> 7c04953badc3... security/brute: Mitigate a brute force attack
 }
 
 /**
@@ -713,6 +1000,10 @@ static void brute_task_fatal_signal(const kernel_siginfo_t *siginfo)
 
 	if (!brute_threat_model_supported(siginfo, *stats))
 		return;
+	if (WARN(!*stats, "No statistical data\n") ||
+	    brute_disabled(*stats) ||
+	    !brute_threat_model_supported(siginfo, *stats))
+		goto unlock;
 
 	brute_manage_fork_attack(*stats, now);
 }
