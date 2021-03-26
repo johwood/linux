@@ -1,0 +1,10 @@
+Changelog v6 -> v7
+
+- Add the "Reviewed-by:" tag to the first patch.
+- Rearrange the brute LSM between lockdown and yama.
+- Split subdir and obj in security/Makefile.
+- Remove the LSM stacking mention in the config help text.
+- Simplify the locking management.
+- Reduce the number of header files included.
+- Notify to userspace that a task has been killed by the brute LSM (Andi Kleen)
+- To be defensive, treat the no stats scenario as an attack (Kees Cook)
