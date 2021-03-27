@@ -3,6 +3,17 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/lsm_hooks.h>
+//#include <linux/math64.h>
+//#include <linux/printk.h>
+//#include <linux/refcount.h>
+//#include <linux/rwlock.h>
+//#include <linux/rwlock_types.h>
+//#include <linux/sched.h>
+//#include <linux/sched/signal.h>
+//#include <linux/sched/task.h>
+//#include <linux/slab.h>
+//#include <linux/spinlock.h>
+//#include <linux/types.h>
 
 /**
  * struct brute_stats - Fork brute force attack statistics.
@@ -260,12 +271,198 @@ static void brute_task_free(struct task_struct *task)
 }
 
 /*
+ * BRUTE_EMA_WEIGHT_NUMERATOR - Weight's numerator of EMA.
+ */
+static const u64 BRUTE_EMA_WEIGHT_NUMERATOR = 7;
+
+/*
+ * BRUTE_EMA_WEIGHT_DENOMINATOR - Weight's denominator of EMA.
+ */
+static const u64 BRUTE_EMA_WEIGHT_DENOMINATOR = 10;
+
+/**
+ * brute_mul_by_ema_weight() - Multiply by EMA weight.
+ * @value: Value to multiply by EMA weight.
+ *
+ * Return: The result of the multiplication operation.
+ */
+static inline u64 brute_mul_by_ema_weight(u64 value)
+{
+	return mul_u64_u64_div_u64(value, BRUTE_EMA_WEIGHT_NUMERATOR,
+				   BRUTE_EMA_WEIGHT_DENOMINATOR);
+}
+
+/*
+ * BRUTE_MAX_FAULTS - Maximum number of faults.
+ *
+ * If a brute force attack is running slowly for a long time, the application
+ * crash period's EMA is not suitable for the detection. This type of attack
+ * must be detected using a maximum number of faults.
+ */
+static const unsigned int BRUTE_MAX_FAULTS = 200;
+
+/**
+ * brute_update_crash_period() - Update the application crash period.
+ * @stats: Statistics that hold the application crash period to update. Cannot
+ *         be NULL.
+ * @now: The current timestamp in jiffies.
+ *
+ * The application crash period must be a value that is not prone to change due
+ * to spurious data and follows the real crash period. So, to compute it, the
+ * exponential moving average (EMA) is used.
+ *
+ * This kind of average defines a weight (between 0 and 1) for the new value to
+ * add and applies the remainder of the weight to the current average value.
+ * This way, some spurious data will not excessively modify the average and only
+ * if the new values are persistent, the moving average will tend towards them.
+ *
+ * Mathematically the application crash period's EMA can be expressed as
+ * follows:
+ *
+ * period_ema = period * weight + period_ema * (1 - weight)
+ *
+ * If the operations are applied:
+ *
+ * period_ema = period * weight + period_ema - period_ema * weight
+ *
+ * And finally, if the operands are ordered:
+ *
+ * period_ema = period_ema - period_ema * weight + period * weight
+ */
+static void brute_update_crash_period(struct brute_stats *stats, u64 now)
+{
+	u64 current_period;
+
+	spin_lock(&stats->lock);
+	current_period = now - stats->jiffies;
+
+	WRITE_ONCE(stats->period,
+		   stats->period - brute_mul_by_ema_weight(stats->period) +
+		   brute_mul_by_ema_weight(current_period));
+
+	if (stats->faults < BRUTE_MAX_FAULTS)
+		WRITE_ONCE(stats->faults, stats->faults + 1);
+
+	WRITE_ONCE(stats->jiffies, now);
+	spin_unlock(&stats->lock);
+}
+
+/*
+ * BRUTE_MIN_FAULTS - Minimum number of faults.
+ *
+ * The application crash period's EMA cannot be used until a minimum number of
+ * data has been applied to it. This constraint allows getting a trend when this
+ * moving average is used. Moreover, it avoids the scenario where an application
+ * fails quickly from execve system call due to reasons unrelated to a real
+ * attack.
+ */
+static const unsigned char BRUTE_MIN_FAULTS = 5;
+
+/*
+ * BRUTE_CRASH_PERIOD_THRESHOLD - Application crash period threshold.
+ *
+ * The units are expressed in milliseconds.
+ *
+ * A fast brute force attack is detected when the application crash period falls
+ * below this threshold.
+ */
+static const u64 BRUTE_CRASH_PERIOD_THRESHOLD = 30000;
+
+/**
+ * brute_attack_running() - Test if a brute force attack is happening.
+ * @stats: Statistical data shared by all the fork hierarchy processes. Cannot
+ *         be NULL.
+ *
+ * The decision if a brute force attack is running is based on the statistical
+ * data shared by all the fork hierarchy processes.
+ *
+ * There are two types of brute force attacks that can be detected using the
+ * statistical data. The first one is a slow brute force attack that is detected
+ * if the maximum number of faults per fork hierarchy is reached. The second
+ * type is a fast brute force attack that is detected if the application crash
+ * period falls below a certain threshold.
+ *
+ * Moreover, it is important to note that no attacks will be detected until a
+ * minimum number of faults have occurred. This allows to have a trend in the
+ * crash period when the EMA is used and also avoids the scenario where an
+ * application fails quickly from execve system call due to reasons unrelated to
+ * a real attack.
+ *
+ * Return: True if a brute force attack is happening. False otherwise.
+ */
+static bool brute_attack_running(const struct brute_stats *stats)
+{
+	u64 faults;
+	u64 crash_period;
+
+	faults = READ_ONCE(stats->faults);
+	if (faults < BRUTE_MIN_FAULTS)
+		return false;
+	if (faults >= BRUTE_MAX_FAULTS)
+		return true;
+
+	crash_period = jiffies64_to_msecs(READ_ONCE(stats->period));
+	return crash_period < BRUTE_CRASH_PERIOD_THRESHOLD;
+}
+
+/**
+ * brute_print_fork_attack_running() - Warn about a fork brute force attack.
+ */
+static inline void brute_print_fork_attack_running(void)
+{
+	pr_warn("Fork brute force attack detected [pid %d, %s]\n", current->pid,
+		current->comm);
+}
+
+/**
+ * brute_manage_fork_attack() - Manage a fork brute force attack.
+ * @stats: Statistical data shared by all the fork hierarchy processes. Cannot
+ *         be NULL.
+ * @now: The current timestamp in jiffies.
+ *
+ * For a correct management of a fork brute force attack it is only necessary to
+ * update the statistics and test if an attack is happening based on these data.
+ */
+static void brute_manage_fork_attack(struct brute_stats *stats, u64 now)
+{
+	brute_update_crash_period(stats, now);
+	if (brute_attack_running(stats))
+		brute_print_fork_attack_running();
+}
+
+/**
+ * brute_task_fatal_signal() - Target for the task_fatal_signal hook.
+ * @siginfo: Contains the signal information.
+ *
+ * To detect a fork brute force attack it is necessary to update the fork
+ * statistics in every fatal crash and act based on these data.
+ *
+ * To be defensive, the scenario where the current task has no statistics is
+ * treated as an attack. Since in this case the current task is in the path to
+ * be killed, only it is necessary to set to ERR the stats pointer.
+ */
+static void brute_task_fatal_signal(const kernel_siginfo_t *siginfo)
+{
+	struct brute_stats **stats;
+	u64 now = get_jiffies_64();
+
+	stats = brute_stats_ptr(current);
+	if (WARN_ON_ONCE(IS_ERR_OR_NULL(*stats))) {
+		WRITE_ONCE(*stats, ERR_PTR(-ESRCH));
+		return;
+	}
+
+	brute_manage_fork_attack(*stats, now);
+}
+
+/*
  * brute_hooks - Targets for the LSM's hooks.
  */
 static struct security_hook_list brute_hooks[] __lsm_ro_after_init = {
 	LSM_HOOK_INIT(task_alloc, brute_task_alloc),
 	LSM_HOOK_INIT(bprm_committing_creds, brute_task_execve),
 	LSM_HOOK_INIT(task_free, brute_task_free),
+	LSM_HOOK_INIT(task_fatal_signal, brute_task_fatal_signal),
 };
 
 /**
